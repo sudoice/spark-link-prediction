@@ -8,6 +8,17 @@ import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
 import org.apache.spark.ml.classification.NaiveBayes
 import org.apache.spark.ml.classification.LinearSVC
 import org.apache.spark.ml.classification.GBTClassifier
+import org.apache.spark.ml.classification.DecisionTreeClassifier
+import org.apache.spark.ml.classification.RandomForestClassifier
+import org.apache.spark.ml.feature.VectorAssembler
+import org.apache.spark.ml.classification.MultilayerPerceptronClassifier
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.ml.linalg.Vector
+import org.apache.spark.ml.evaluation.BinaryClassificationEvaluator
+import org.apache.spark.ml.tuning.{ParamGridBuilder, CrossValidator}
+import org.apache.spark.ml.classification.RandomForestClassificationModel
+import org.apache.spark.ml.classification.DecisionTreeClassificationModel
+
 
 object Predictor {
   // making this variable global in order to allow "spark.implicits._" be used on every function without re-importing
@@ -375,6 +386,83 @@ object Predictor {
     }
   }
 
+  def calculateMetricsMLP(predictions: DataFrame): Double = {
+    // Using probability scores instead of binary predictions
+    val predictionAndLabels = predictions
+      .select("label", "probability")
+      .rdd
+      .map(row => {
+        // Extract probability of positive class (class 1)
+        val probability = row.getAs[org.apache.spark.ml.linalg.Vector]("probability").toArray(1)
+        (probability, row.getAs[Double]("label"))
+      })
+    
+    val metrics = new BinaryClassificationMetrics(predictionAndLabels)
+    
+    
+    
+    // Get F1-Score by threshold
+    val f1ScoreByThreshold = metrics.fMeasureByThreshold().collect()
+    
+    // Find threshold that gives the best F1 score
+    val bestF1Threshold = f1ScoreByThreshold.maxBy(_._2)
+    val optimalThreshold = bestF1Threshold._1
+    val bestF1Score = bestF1Threshold._2
+    
+   
+    
+    // Find precision and recall at the best threshold
+    val precisionAtOptimalThreshold = metrics.precisionByThreshold()
+      .filter(_._1 == optimalThreshold)
+      .first()._2
+    
+    val recallAtOptimalThreshold = metrics.recallByThreshold()
+      .filter(_._1 == optimalThreshold)
+      .first()._2
+    
+    
+    // For negative class (class 0) - need to compute from confusion matrix
+    // Create UDF to extract probability of class 1
+    val getProb1 = udf((v: org.apache.spark.ml.linalg.Vector) => v.toArray(1))
+    
+    val predictionsWithThreshold = predictions
+      .withColumn("prob1", getProb1(col("probability")))
+      .withColumn("prediction_optimal", 
+        when(col("prob1") >= optimalThreshold, 1.0).otherwise(0.0))
+    
+    val tp = predictionsWithThreshold.filter(col("prediction_optimal") === 1.0 && col("label") === 1.0).count()
+    val fp = predictionsWithThreshold.filter(col("prediction_optimal") === 1.0 && col("label") === 0.0).count()
+    val tn = predictionsWithThreshold.filter(col("prediction_optimal") === 0.0 && col("label") === 0.0).count()
+    val fn = predictionsWithThreshold.filter(col("prediction_optimal") === 0.0 && col("label") === 1.0).count()
+    
+    // For negative class, precision = TN/(TN+FN), recall = TN/(TN+FP)
+    val precision0 = if (tn + fn > 0) tn.toDouble / (tn + fn) else 0.0
+    val recall0 = if (tn + fp > 0) tn.toDouble / (tn + fp) else 0.0
+    val f1Score0 = if (precision0 + recall0 > 0) 2 * precision0 * recall0 / (precision0 + recall0) else 0.0
+    
+    
+   
+    // Overall accuracy
+    val accuracy = (tp + tn).toDouble / (tp + tn + fp + fn)
+    
+
+    accuracy
+  }
+
+  def generateLayerConfigs(inputSize: Int,
+                         outputSize: Int = 2,
+                         maxHiddenLayers: Int = 3,
+                         maxNeurons: Int = 16,
+                         step: Int = 4): Seq[Array[Int]] = {
+
+  val configs = for {
+    numHiddenLayers <- 1 to maxHiddenLayers
+    hiddenSizes <- Seq.fill(numHiddenLayers)(step to maxNeurons by step).flatten.combinations(numHiddenLayers)
+  } yield Array(inputSize) ++ hiddenSizes ++ Array(outputSize)
+
+  configs.distinct
+}
+
   /**
    * Calculates and prints the metrics for the predictions of a binary classification model.
    *
@@ -461,80 +549,206 @@ object Predictor {
    *
    * @param sparkContext the current Spark Context
    */
-  def p1(sparkContext: SparkContext, mn: Int): Unit = {
-    println("Retrieving DataFrames...")
-    val infoDataFrame = preProcess(getInfoDataFrame(spark, Configuration.NODE_INFO_FILENAME)
-      .sample(Configuration.INFO_DATAFRAME_PORTION, 12345L))
-    val trainingDataFrame = getTrainingDataFrame(sparkContext, Configuration.TRAINING_SET_FILENAME)
-    val testingDataFrame = getTestingDataFrame(sparkContext, Configuration.TESTING_SET_FILENAME)
-    val groundTruthDataFrame = getGroundTruthDataFrame(sparkContext, Configuration.GROUND_TRUTH_FILENAME)
-    val labeledTestingDataFrame = addLabelsToTestDataFrame(testingDataFrame, groundTruthDataFrame)
+def p1(sparkContext: SparkContext, mn: Int): Unit = {
+  println("Retrieving DataFrames...")
+  val infoDataFrame = preProcess(getInfoDataFrame(spark, Configuration.NODE_INFO_FILENAME)
+    .sample(Configuration.INFO_DATAFRAME_PORTION, 12345L))
+  val trainingDataFrame = getTrainingDataFrame(sparkContext, Configuration.TRAINING_SET_FILENAME)
+  val testingDataFrame = getTestingDataFrame(sparkContext, Configuration.TESTING_SET_FILENAME)
+  val groundTruthDataFrame = getGroundTruthDataFrame(sparkContext, Configuration.GROUND_TRUTH_FILENAME)
+  val labeledTestingDataFrame = addLabelsToTestDataFrame(testingDataFrame, groundTruthDataFrame)
 
-    println("Joining DataFrames...")
-    val joinedTrainDataFrame = joinDataFrames(trainingDataFrame, infoDataFrame)
-    val joinedTestDataFrame = joinDataFrames(labeledTestingDataFrame, infoDataFrame)
+  println("Joining DataFrames...")
+  val joinedTrainDataFrame = joinDataFrames(trainingDataFrame, infoDataFrame)
+  val joinedTestDataFrame = joinDataFrames(labeledTestingDataFrame, infoDataFrame)
 
-    val finalTrainDataFrame = getFinalDataFrame(joinedTrainDataFrame)
-    val finalTestDataFrame = getFinalDataFrame(joinedTestDataFrame)
-    val model = if(mn == 0) {
-      println("Running Logistic Regression classification...\n")
-      new LogisticRegression()
-        .setFeaturesCol("features")
-        .setLabelCol("label")
-        .setPredictionCol("prediction")
-        .setProbabilityCol("probability")
-        .setRawPredictionCol("prediction_raw")
-        .setMaxIter(Configuration.LOGISTIC_REGRESSION_ITERATIONS)
-    } else if(mn == 1) {
-      println("Running Naive Bayes classification...\n")
-      new NaiveBayes()
-        .setFeaturesCol("features")
-        .setLabelCol("label")
-        .setPredictionCol("prediction")
-        .setProbabilityCol("probability")
-        .setModelType("multinomial")
-        .setSmoothing(1.0)
-    } else if(mn == 2) {
-      println("Running Linear SVM classification...\n")
-      new LinearSVC()
-        .setFeaturesCol("features")
-        .setLabelCol("label")
-        .setPredictionCol("prediction")
-        .setMaxIter(10)
-        .setRegParam(0.1)
-        .setTol(1e-4)
-    } else {
-      println("Running Gradient Boosted Trees classification...\n")
-      new GBTClassifier()
-        .setFeaturesCol("features")
-        .setLabelCol("label")
-        .setPredictionCol("prediction")
-        .setProbabilityCol("probability")
-        .setMaxIter(2)
-        .setMaxDepth(2)
-        .setStepSize(0.1)
-        .setMaxBins(32)
-        .setMinInstancesPerNode(1)
-        .setMinInfoGain(0.0)
-        .setSubsamplingRate(0.8)
-        .setSeed(1234L)
-    }
+  val finalTrainDataFrame = getFinalDataFrame(joinedTrainDataFrame)
+  val finalTestDataFrame = getFinalDataFrame(joinedTestDataFrame)
 
-    val predictions = model
-      .fit(finalTrainDataFrame)
-      .transform(finalTestDataFrame)
+  var predictions: DataFrame = null
 
+  if (mn == 0) {
+    println("Running Logistic Regression classification...\n")
+    val model = new LogisticRegression()
+      .setFeaturesCol("features")
+      .setLabelCol("label")
+      .setPredictionCol("prediction")
+      .setProbabilityCol("probability")
+      .setRawPredictionCol("prediction_raw")
+      .setMaxIter(Configuration.LOGISTIC_REGRESSION_ITERATIONS)
+
+    predictions = model.fit(finalTrainDataFrame).transform(finalTestDataFrame)
     println("Calculating metrics...\n")
-    if(mn == 2){
-      calculateMetricsSVM(predictions)
-    } else {
-      calculateMetrics(predictions)
+    calculateMetrics(predictions)
+
+  } else if (mn == 1) {
+    println("Running Naive Bayes classification...\n")
+    val model = new NaiveBayes()
+      .setFeaturesCol("features")
+      .setLabelCol("label")
+      .setPredictionCol("prediction")
+      .setProbabilityCol("probability")
+      .setModelType("multinomial")
+      .setSmoothing(1.0)
+
+    predictions = model.fit(finalTrainDataFrame).transform(finalTestDataFrame)
+    println("Calculating metrics...\n")
+    calculateMetrics(predictions)
+
+  } else if (mn == 2) {
+    println("Running Linear SVM classification...\n")
+    val model = new LinearSVC()
+      .setFeaturesCol("features")
+      .setLabelCol("label")
+      .setPredictionCol("prediction")
+      .setMaxIter(10)
+      .setRegParam(0.1)
+      .setTol(1e-4)
+
+    predictions = model.fit(finalTrainDataFrame).transform(finalTestDataFrame)
+    println("Calculating metrics...\n")
+    calculateMetricsSVM(predictions)
+
+  } else if (mn == 3) {
+    println("Running Gradient Boosted Trees classification...\n")
+    val model = new GBTClassifier()
+      .setFeaturesCol("features")
+      .setLabelCol("label")
+      .setPredictionCol("prediction")
+      .setProbabilityCol("probability")
+      .setMaxIter(2)
+      .setMaxDepth(2)
+      .setStepSize(0.1)
+      .setMaxBins(32)
+      .setMinInstancesPerNode(1)
+      .setMinInfoGain(0.0)
+      .setSubsamplingRate(0.8)
+      .setSeed(1234L)
+
+    predictions = model.fit(finalTrainDataFrame).transform(finalTestDataFrame)
+    println("Calculating metrics...\n")
+    calculateMetrics(predictions)
+
+  } else if (mn == 4) {
+  println("Running Decision Tree classification with dynamic maxDepth tuning...\n")
+
+  // Create the DecisionTreeClassifier model
+  val model = new DecisionTreeClassifier()
+    .setFeaturesCol("features")
+    .setLabelCol("label")
+    .setPredictionCol("prediction")
+
+  // Create a BinaryClassificationEvaluator for model evaluation
+  val evaluator = new BinaryClassificationEvaluator()
+    .setLabelCol("label")
+    .setRawPredictionCol("prediction")
+
+  // Create a parameter grid for tuning maxDepth
+  val paramGrid = new ParamGridBuilder()
+    .addGrid(model.maxDepth, Array(5, 10, 15, 20))  // Different values of maxDepth to try
+    .build()
+
+  // Create the CrossValidator
+  val crossValidator = new CrossValidator()
+    .setEstimator(model)
+    .setEvaluator(evaluator)
+    .setEstimatorParamMaps(paramGrid)  // The param grid for tuning maxDepth
+    .setNumFolds(5)  // Number of folds for cross-validation
+
+  // Perform cross-validation to find the best model
+  println("Running Cross-Validation for optimal maxDepth...\n")
+  val cvModel = crossValidator.fit(finalTrainDataFrame)
+
+  // Get the best model and make predictions on the test data
+  val bestModel = cvModel.bestModel
+  val predictions = bestModel.transform(finalTestDataFrame)
+
+  // Get and print the best maxDepth
+  val bestMaxDepth = bestModel.asInstanceOf[DecisionTreeClassificationModel].getMaxDepth
+  println("Best maxDepth: " + bestMaxDepth)
+
+  // Calculate and print metrics
+  println("Calculating metrics...\n")
+  calculateMetrics(predictions)
+
+}  else if (mn == 5) {
+  println("Running Random Forest classification with dynamic maxDepth tuning...\n")
+
+  // Create the RandomForestClassifier model
+  val model = new RandomForestClassifier()
+    .setFeaturesCol("features")
+    .setLabelCol("label")
+    .setPredictionCol("prediction")
+
+  // Create a BinaryClassificationEvaluator for model evaluation
+  val evaluator = new BinaryClassificationEvaluator()
+    .setLabelCol("label")
+    .setRawPredictionCol("prediction")
+
+  // Create a parameter grid for tuning maxDepth
+  val paramGrid = new ParamGridBuilder()
+    .addGrid(model.maxDepth, Array(5, 10, 15, 20))  // Different values of maxDepth to try
+    .build()
+
+  // Create the CrossValidator
+  val crossValidator = new CrossValidator()
+    .setEstimator(model)
+    .setEvaluator(evaluator)
+    .setEstimatorParamMaps(paramGrid)  // The param grid for tuning maxDepth
+    .setNumFolds(5)  // Number of folds for cross-validation
+
+  // Perform cross-validation to find the best model
+  println("Running Cross-Validation for optimal maxDepth...\n")
+  val cvModel = crossValidator.fit(finalTrainDataFrame)
+
+  // Get the best model and make predictions on the test data
+  val bestModel = cvModel.bestModel
+  val predictions = bestModel.transform(finalTestDataFrame)
+
+  println("Best maxDepth: " + bestModel.asInstanceOf[RandomForestClassificationModel].getMaxDepth)
+
+  // Calculate and print metrics
+  println("Calculating metrics...\n")
+  calculateMetrics(predictions)
+} else {
+    println("Running Multilayer Perceptron classification ...")
+    val inputSize = finalTrainDataFrame.select("features").first().getAs[Vector]("features").size
+    val layerOptions = generateLayerConfigs(inputSize)
+
+    var bestAcc = 0.0
+    var bestLayers: Array[Int] = Array()
+    var bestPredictionDF: DataFrame = null
+
+    for (layer <- layerOptions) {
+      val mlp = new MultilayerPerceptronClassifier()
+        .setFeaturesCol("features")
+        .setLabelCol("label")
+        .setPredictionCol("prediction")
+        .setLayers(layer)
+        .setMaxIter(100)
+        .setBlockSize(128)
+        .setSeed(1234L)
+
+      val mod = mlp.fit(finalTrainDataFrame)
+      val preds = mod.transform(finalTestDataFrame)
+      val accuracy = calculateMetricsMLP(preds)
+
+      if (accuracy > bestAcc) {
+        bestAcc = accuracy
+        bestLayers = layer
+        bestPredictionDF = preds
+      }
     }
+
+    println("Calculating metrics for best MLP model...\n")
+    calculateMetrics(bestPredictionDF)
   }
+}
+
   def main(args: Array[String]): Unit = {
     val sparkContext = spark.sparkContext
     sparkContext.setLogLevel("ERROR")
-    p1(sparkContext, 0)
+    p1(sparkContext, 4)
     spark.stop()
   }
 }
